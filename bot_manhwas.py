@@ -15,7 +15,6 @@ COLLECTION_NAME = os.getenv('COLLECTION_NAME')
 # Configuración del bot
 intents = discord.Intents.default()
 intents.message_content = True # Activa la intención de mensajes para detectar los eventos
-intents.members = True  # Activa la intención de miembros para detectar los eventos
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Conexión a MongoDB
