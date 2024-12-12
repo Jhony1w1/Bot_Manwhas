@@ -7,10 +7,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 # variables de entorno
-mongo_url = os.getenv('MONGO_URL')
-discord_token = os.getenv('DISCORD_BOT_TOKEN')
-base_name = os.getenv('BASE_NAME')
-collection_name = os.getenv('COLLECTION_NAME')
+MONGO_URL = os.getenv('MONGO_URL')
+DISCORD_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+DATABASE_NAME = os.getenv('DATABASE_NAME')
+COLLECTION_NAME = os.getenv('COLLECTION_NAME')
 
 # Configuración del bot
 intents = discord.Intents.default()
@@ -19,9 +19,9 @@ intents.members = True  # Activa la intención de miembros para detectar los eve
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Conexión a MongoDB
-client = MongoClient(mongo_url)
-db = client[base_name]
-collection = db[collection_name]
+client = MongoClient(MONGO_URL)
+db = client[DATABASE_NAME]
+collection = db[COLLECTION_NAME]
 
 # Evento on_ready
 @bot.event
@@ -162,5 +162,5 @@ async def listar(ctx, nombre_manhwa: str = None):
         print(e)
 
 # Token del bot
-TOKEN = discord_token
+TOKEN = DISCORD_TOKEN
 bot.run(TOKEN)
