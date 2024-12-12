@@ -162,5 +162,4 @@ async def listar(ctx, nombre_manhwa: str = None):
         print(e)
 
 # Token del bot
-TOKEN = DISCORD_TOKEN
-bot.run(TOKEN)
+bot.run(DISCORD_TOKEN)
