@@ -296,7 +296,9 @@ async def on_reaction_add(reaction, user):
     if reaction.emoji == '✅':
         try:
             # Obtener el título del embed (nombre del manhwa)
-            nombre_manhwa = reaction.message.embeds[0].title.split(" de ")[1].strip()
+            nombre_manhwa = " de ".join(reaction.message.embeds[0].title.split(" de ")[1:]).strip() # 1: para que tome todo lo que sigue y el join para unirlo
+
+            print(nombre_manhwa)
 
             message = reaction.message
             # Intentar extraer el capítulo del título del embed usando expresión regular
