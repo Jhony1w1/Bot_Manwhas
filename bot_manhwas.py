@@ -289,8 +289,7 @@ async def on_reaction_add(reaction, user):
             
     print("No hubo error")
 
-    # Limpiar el diccionario sólo cuando se procesó correctamente
-    del usuarios_que_listaron['nombre']
+    
 
     # Verificar que la reacción sea de un capítulo (en este caso, '✅')
     if reaction.emoji == '✅':
@@ -310,7 +309,7 @@ async def on_reaction_add(reaction, user):
                 raise ValueError("No se pudo encontrar el capítulo en el título.")
 
             # Realizar la búsqueda en la base de datos de manera flexible
-            manhwa = collection.find_one({"nombre_manhwa": {"$regex": f"^{re.escape(nombre_manhwa)}$", "$options": "i"}})
+            manhwa = collection.find_one({"nombre_manhwa": {"$regex": f"^{re.escape(nombre_manhwa)}$", "$options": "i"}, "usuario": str(user)})
 
             if manhwa:
                 # Actualizar el capítulo
@@ -327,9 +326,13 @@ async def on_reaction_add(reaction, user):
                     await reaction.message.channel.send("❌ No se pudo actualizar el capítulo.")
             else:
                 await reaction.message.channel.send(f"❌ No se encontró el manhwa '{nombre_manhwa}'.")
+            # Limpiar el diccionario sólo cuando se procesó correctamente
+            del usuarios_que_listaron['nombre']
 
         except Exception as e:
             await reaction.message.channel.send(f"❌ Error al procesar la reacción: {str(e)}")
+            # Limpiar el diccionario sólo cuando se procesó correctamente
+            del usuarios_que_listaron['nombre']
 
 # Token del bot
 bot.run(DISCORD_TOKEN)
