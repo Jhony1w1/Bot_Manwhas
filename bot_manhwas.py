@@ -169,7 +169,7 @@ async def guardar(ctx, *, datos: str): # El argumento datos es una cadena que pu
 
 
 @bot.command()
-async def listar(ctx, nombre_manhwa: str = None):
+async def listar(ctx, *, nombre_manhwa: str = None):
     try:
 
         result = collection2.find_one({"usuario": str(ctx.author)})
@@ -187,6 +187,8 @@ async def listar(ctx, nombre_manhwa: str = None):
         query = {"usuario": usuario}
         if nombre_manhwa:
             query["nombre_manhwa"] = {"$regex": nombre_manhwa, "$options": "i"}  # Búsqueda parcial e insensible a mayúsculas
+
+        print(query)
 
         registros = list(collection.find(query))
         if not registros:
