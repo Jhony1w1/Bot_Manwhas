@@ -94,7 +94,7 @@ async def admin(ctx, usuario: str):
     }
     
     # Insertar en la base de datos
-    collection3.insert_one(nuevo_registro)
+    collection2.insert_one(nuevo_registro)
     
     # Mensaje de confirmación con embed
     embed = discord.Embed(
