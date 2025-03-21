@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import logging
 import re
 import asyncio
+from discord.ui import View, Button
 
 load_dotenv()
 # variables de entorno
@@ -33,14 +34,14 @@ collection = db[COLLECTION_NAME]
 collection2 = db[COLLECTION_NAME2]
 collection3 = db[COLLECTION_NAME3]
 
-usuarios_que_listaron = {}
+manhwa_tracking = {}  # Diccionario para rastrear mensajes y manhwas
 
 # Evento on_ready
 @bot.event
 async def on_ready():
     print(f"Bot conectado como {bot.user}")
 
-
+# muestra la lista de comandos del bot
 @bot.command(name='info')
 async def info(ctx):
 
@@ -60,12 +61,16 @@ async def info(ctx):
     embed.add_field(
         name="📋 Comandos Disponibles:",
         value=(
+            "**• !info**\n"
+            "  Muestra la información del bot\n\n"
             "**• !guardar [nombre],[capitulo],[link] (opcional)**\n"
             "  Guarda un nuevo manhwa en tu lista\n\n"
             "**• !listar**\n"
             "  Muestra todos tus manhwas guardados\n\n"
             "**• !listar [nombre]**\n"
-            "  Busca un manhwa en tu lista y selecciona hasta que capitulo has leído"
+            "  Busca un manhwa en tu lista y selecciona hasta que capitulo has leído\n\n"
+            "**• !lector [nickname]**\n"
+            "  Le asigna permisos a un usuario para poder guardar manhwas, mangas, manhuas en el bot\n\n"
         ),
         inline=False
     )
@@ -78,8 +83,8 @@ async def info(ctx):
 
     await ctx.send(embed=embed)
 
-
-@bot.command(name='admin')
+# concede permisos a un usuario para que pueda guardar manhwas en el bot, solo permitido por el admin
+@bot.command(name='lector')
 async def admin(ctx, usuario: str):
 
     result = collection3.find_one({"usuario": str(ctx.author)})
@@ -106,7 +111,7 @@ async def admin(ctx, usuario: str):
 
     await ctx.send(embed=embed)
 
-@bot.command()
+@bot.command(name='guardar')
 async def guardar(ctx, *, datos: str): # El argumento datos es una cadena que puede contener espacios, * captura toda la linea de texto
     try:
         
@@ -166,166 +171,166 @@ async def guardar(ctx, *, datos: str): # El argumento datos es una cadena que pu
         await ctx.send("❌ Error al guardar el manhwa.")
         print(e)
 
-
-
-@bot.command()
-async def listar(ctx, nombre_manhwa: str = None):
+# listar uno o varios manhwas
+@bot.command(name="listar")
+async def listar(ctx, *, nombre_manhwa: str = None):
     try:
-
         result = collection2.find_one({"usuario": str(ctx.author)})
-
         if result is None:
             await ctx.send("❌ No tienes permisos suficientes para realizar esta acción.")
             return
-        
-        usuario = str(ctx.author)
 
-        # Almacenar el usuario que ejecutó el comando
-        usuarios_que_listaron['nombre'] = usuario
-
-        # Filtrar por usuario y opcionalmente por nombre de manhwa
-        query = {"usuario": usuario}
         if nombre_manhwa:
-            query["nombre_manhwa"] = {"$regex": nombre_manhwa, "$options": "i"}  # Búsqueda parcial e insensible a mayúsculas
+            await listar_por_nombre(ctx, nombre_manhwa)
+        else:
+            await listar_todos(ctx)
 
-        registros = list(collection.find(query))
-        if not registros:
-            await ctx.send("🔍 No se encontraron manhwas para este usuario.")
-            return
+    except Exception:
+        await ctx.send("❌ Hubo un error al listar los manhwas.")
 
-        embeds = []
-        current_embed = discord.Embed(
-            title=f"📚 Manhwas de {usuario}",
+async def listar_todos(ctx):
+    usuario = str(ctx.author)
+    query = {"usuario": usuario}
+    registros = list(collection.find(query))
+
+    if not registros:
+        await ctx.send("🔍 No se encontraron manhwas para este usuario.")
+        return
+
+    # Variables para la paginación
+    pagina_actual = 0
+    manhwas_por_pagina = 25
+    total_paginas = (len(registros) - 1) // manhwas_por_pagina + 1
+
+    async def obtener_embed(pagina):
+        """Genera un embed con los manhwas de la página dada."""
+        inicio = pagina * manhwas_por_pagina
+        fin = inicio + manhwas_por_pagina
+        registros_pagina = registros[inicio:fin]
+
+        embed = discord.Embed(
+            title=f"📚 Manhwas de {usuario} (Página {pagina + 1}/{total_paginas})",
             color=discord.Color.blue()
         )
 
-        if nombre_manhwa:
-            # Mostrar el manhwa con su capítulo y enlaces a los siguientes capítulos
-            for registro in registros[:1]:  # Solo mostrar el manhwa que coincida con el nombre
-                valor_manhwa = (
-                    f"**Capítulo actual:** {registro['capitulo']}\n"
-                    f"**Fecha Guardado:** {registro['fecha_guardado'].strftime('%Y-%m-%d')}\n"
-                    f"**Link:** [Ir al manhwa]({registro['link']})"
-                )
+        for registro in registros_pagina:
+            valor_manhwa = (
+                f"**Capítulo actual:** {registro['capitulo']}\n"
+                f"**Fecha Guardado:** {registro['fecha_guardado'].strftime('%Y-%m-%d')}"
+            )
+            embed.add_field(name=f"📖 {registro['nombre_manhwa']}", value=valor_manhwa, inline=False)
 
-                current_embed.add_field(
-                    name=f"📖 {registro['nombre_manhwa']}",
-                    value=valor_manhwa,
-                    inline=False
-                )
+        return embed
 
-            embeds.append(current_embed)
+    async def actualizar_mensaje(interaction, pagina):
+        """Edita el mensaje con la nueva página del embed."""
+        nonlocal pagina_actual
+        pagina_actual = pagina
+        view = crear_vista()
+        await interaction.response.defer()
+        await interaction.message.edit(embed=await obtener_embed(pagina_actual), view=view)
 
-            # Crear 5 embeds con los enlaces a los próximos 5 capítulos (cada uno en su propio embed)
-            for i in range(1, 6):
-                siguiente_capitulo = registro['capitulo'] + i
-                link_capitulo = f"[Capítulo {siguiente_capitulo}](https://discord.com/channels/{ctx.guild.id}/{ctx.channel.id}/{str(registro['_id'])}/{siguiente_capitulo})"
-                
-                chapter_embed = discord.Embed(
-                    title=f"📚 Capítulo {siguiente_capitulo} de {registro['nombre_manhwa']}",
-                    color=discord.Color.green()
-                )
-                chapter_embed.add_field(
-                    name=f"Capítulo {siguiente_capitulo}",
-                    value=link_capitulo,
-                    inline=False
-                )
+    def crear_vista():
+        """Crea los botones de paginación."""
+        view = View(timeout=60)
 
-                embeds.append(chapter_embed)
+        boton_anterior = Button(label="⬅️ Anterior", style=discord.ButtonStyle.primary, disabled=(pagina_actual == 0))
+        boton_siguiente = Button(label="➡️ Siguiente", style=discord.ButtonStyle.primary, disabled=(pagina_actual >= total_paginas - 1))
 
-        else:
-            # Mostrar los primeros 5 manhwas sin enlaces a capítulos
-            for registro in registros[-25:]:
-                valor_manhwa = (
-                    f"**Capítulo actual:** {registro['capitulo']}\n"
-                    f"**Fecha Guardado:** {registro['fecha_guardado'].strftime('%Y-%m-%d')}"
-                )
+        async def anterior_callback(interaction: discord.Interaction):
+            if pagina_actual > 0:
+                await actualizar_mensaje(interaction, pagina_actual - 1)
 
-                current_embed.add_field(
-                    name=f"📖 {registro['nombre_manhwa']}",
-                    value=valor_manhwa,
-                    inline=False
-                )
+        async def siguiente_callback(interaction: discord.Interaction):
+            if pagina_actual < total_paginas - 1:
+                await actualizar_mensaje(interaction, pagina_actual + 1)
 
-            embeds.append(current_embed)
+        boton_anterior.callback = anterior_callback
+        boton_siguiente.callback = siguiente_callback
 
-        # Enviar todos los embeds generados
-        for embed in embeds:
-            message = await ctx.send(embed=embed)
+        view.add_item(boton_anterior)
+        view.add_item(boton_siguiente)
+        return view
 
-            # Solo agregar reacción si estamos en el contexto de un manhwa específico
-            if nombre_manhwa:
-                # Solo agregar la reacción a los embeds de capítulos
-                if "Capítulo" in embed.title:
-                    await message.add_reaction('✅')
-                    
-        # Esperar 30 segundos para permitir reacciones
-        await asyncio.sleep(30)
+    # Enviar el mensaje inicial con la primera página
+    await ctx.send(embed=await obtener_embed(pagina_actual), view=crear_vista())
 
-        # Después del tiempo, limpiar el estado si aún no se procesó ninguna reacción
-        if usuarios_que_listaron.get('nombre') == usuario:
-            del usuarios_que_listaron['nombre']
-            await ctx.send(f"⏳ Se agotó el tiempo para reaccionar.")
+async def listar_por_nombre(ctx, nombre_manhwa):
+    usuario = str(ctx.author)
+    query = {"usuario": usuario, "nombre_manhwa": {"$regex": nombre_manhwa, "$options": "i"}}
+    registros = list(collection.find(query))
 
-    except Exception as e:
-        await ctx.send("❌ Hubo un error al listar los manhwas.")
-        print(e)
-
-@bot.event
-async def on_reaction_add(reaction, user):
-    if user == bot.user:
-        return  # Ignorar las reacciones del bot
-    
-    if not usuarios_que_listaron:
+    if not registros:
+        await ctx.send("🔍 No se encontraron manhwas con ese nombre.")
         return
 
-    # Verificar que el que reaccionó sea igual al que listó
-    if str(user) != str(usuarios_que_listaron['nombre']):
-        print("Entró, así que hay un error")
-        await reaction.message.channel.send(f"❌ {user} no puedes reaccionar porque no listaste este manhwa.")
-        return
-            
-    print("No hubo error")
+    registro = registros[0]  # Tomamos el primer resultado coincidente
 
-    # Limpiar el diccionario sólo cuando se procesó correctamente
-    del usuarios_que_listaron['nombre']
+    embed = discord.Embed(title=f"📚 Manhwa: {registro['nombre_manhwa']}", color=discord.Color.blue())
+    valor_manhwa = (
+        f"**Capítulo actual:** {registro['capitulo']}\n"
+        f"**Fecha Guardado:** {registro['fecha_guardado'].strftime('%Y-%m-%d')}\n"
+        f"**Link:** [Ir al manhwa]({registro['link']})"
+    )
+    embed.add_field(name="📖 Detalles", value=valor_manhwa, inline=False)
 
-    # Verificar que la reacción sea de un capítulo (en este caso, '✅')
-    if reaction.emoji == '✅':
+    # Enviar el mensaje con el botón
+    view = crear_vista_boton(usuario, registro["nombre_manhwa"])
+    message = await ctx.send(embed=embed, view=view)
+
+    # Guardar la referencia
+    manhwa_tracking[message.id] = {"usuario": usuario, "nombre_manhwa": registro["nombre_manhwa"]}
+
+def crear_vista_boton(usuario, nombre_manhwa):
+    """Crea una vista con un botón para actualizar el capítulo."""
+    view = View()
+
+    async def boton_callback(interaction: discord.Interaction):
+        """Maneja la solicitud de actualización del capítulo."""
+        if str(interaction.user) != usuario:
+            await interaction.response.send_message("❌ No puedes actualizar este capítulo.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("📖 ¿A qué capítulo deseas actualizar?", ephemeral=True)
+
+        def check(m):
+            return m.author == interaction.user and m.channel == interaction.channel and m.content.isdigit()
+
         try:
-            # Obtener el título del embed (nombre del manhwa)
-            nombre_manhwa = reaction.message.embeds[0].title.split(" de ")[1].strip()
+            msg = await bot.wait_for("message", check=check, timeout=15)
 
-            message = reaction.message
-            # Intentar extraer el capítulo del título del embed usando expresión regular
-            match = re.search(r"Capítulo (\d+)", message.embeds[0].title)
+            # Validación para asegurarse de que el mensaje sea un número
+            try:
+                nuevo_capitulo = int(msg.content)
+            except ValueError:
+                await interaction.channel.send("❌ El capítulo debe ser un número válido.")
+                return  # Salir de la función o continuar con el flujo de error
 
-            if match:
-                capitulo = int(match.group(1))  # Extraemos el capítulo como número
-            else:
-                raise ValueError("No se pudo encontrar el capítulo en el título.")
-
-            # Realizar la búsqueda en la base de datos de manera flexible
-            manhwa = collection.find_one({"nombre_manhwa": {"$regex": f"^{re.escape(nombre_manhwa)}$", "$options": "i"}})
+            # Buscar el manhwa en la base de datos
+            manhwa = collection.find_one({"usuario": usuario, "nombre_manhwa": {"$regex": f"^{re.escape(nombre_manhwa)}$", "$options": "i"}})
 
             if manhwa:
-                # Actualizar el capítulo
-                capitulo_siguiente = capitulo
-                fecha_actualizacion = datetime.now()  # Fecha y hora actual
                 result = collection.update_one(
                     {"_id": manhwa["_id"]},
-                    {"$set": {"capitulo": capitulo_siguiente, "fecha_guardado": fecha_actualizacion}}
+                    {"$set": {"capitulo": nuevo_capitulo, "fecha_guardado": datetime.now()}}
                 )
 
                 if result.modified_count > 0:
-                    await reaction.message.channel.send(f"✅ El manhwa **{nombre_manhwa}** ha sido actualizado al capitulo **{capitulo}**.")
+                    await interaction.channel.send(f"✅ **{nombre_manhwa}** ha sido actualizado al capítulo **{nuevo_capitulo}**.")
                 else:
-                    await reaction.message.channel.send("❌ No se pudo actualizar el capítulo.")
+                    await interaction.channel.send("❌ No se pudo actualizar el capítulo.")
             else:
-                await reaction.message.channel.send(f"❌ No se encontró el manhwa '{nombre_manhwa}'.")
+                await interaction.channel.send(f"❌ No se encontró el manhwa '{nombre_manhwa}'.")
 
-        except Exception as e:
-            await reaction.message.channel.send(f"❌ Error al procesar la reacción: {str(e)}")
+        except TimeoutError:
+            await interaction.followup.send("⏳ No ingresaste el número del capítulo a tiempo.", ephemeral=True)
+
+    # Crear el botón y agregarlo a la vista
+    boton = Button(label="🔄️Actualizar capítulo", style=discord.ButtonStyle.success)
+    boton.callback = boton_callback
+    view.add_item(boton)
+
+    return view
 
 # Token del bot
 bot.run(DISCORD_TOKEN)
