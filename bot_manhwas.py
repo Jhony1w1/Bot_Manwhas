@@ -134,7 +134,7 @@ async def guardar(ctx, *, datos: str): # El argumento datos es una cadena que pu
         
         # Convertir capítulo a entero, manejar posibles errores
         try:
-            capitulo = int(partes[1])
+            capitulo = float(partes[1])
         except ValueError:
             await ctx.send("❌ El capítulo debe ser un número válido.")
             return
@@ -301,7 +301,7 @@ def crear_vista_boton(usuario, nombre_manhwa):
 
             # Validación para asegurarse de que el mensaje sea un número
             try:
-                nuevo_capitulo = int(msg.content)
+                nuevo_capitulo = float(msg.content)
             except ValueError:
                 await interaction.channel.send("❌ El capítulo debe ser un número válido.")
                 return  # Salir de la función o continuar con el flujo de error
