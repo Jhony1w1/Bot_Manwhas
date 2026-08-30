@@ -2,11 +2,14 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from pymongo import MongoClient
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 import logging
 import re
+import json
+import io
+import random
 from discord.ui import View, Button, Select, Modal, TextInput
 
 load_dotenv()
@@ -48,6 +51,16 @@ collection3 = db[COLLECTION_NAME3]
 
 manhwa_tracking = {}  # Diccionario para rastrear mensajes y manhwas
 
+ESTADOS = {
+    "leyendo": "📖 Leyendo",
+    "favorito": "⭐ Favorito",
+    "en_pausa": "⏸️ En pausa",
+    "terminado": "✅ Terminado",
+    "dropeado": "🗑️ Dropeado",
+}
+
+UMBRAL_DIAS_RECORDATORIO = 14  # días sin actualizar un manhwa "Leyendo" antes de considerarlo olvidado
+
 # Evento on_ready
 @bot.event
 async def on_ready():
@@ -87,9 +100,9 @@ async def info(ctx):
         color=discord.Color.blue()
     )
 
-    # Sección de Comandos
+    # Sección de Comandos (1/2)
     embed.add_field(
-        name="📋 Comandos Disponibles:",
+        name="📋 Comandos Disponibles (1/2):",
         value=(
             "**• info**\n"
             "  Muestra la información del bot\n\n"
@@ -102,6 +115,26 @@ async def info(ctx):
             "  Busca un manhwa en tu lista y selecciona hasta que capitulo has leído\n\n"
             "**• eliminar [nombre]**\n"
             "  Elimina un manhwa de tu lista\n\n"
+            "**• estado [nombre]**\n"
+            "  Cambia el estado de lectura (Leyendo, Favorito, En pausa, Terminado, Dropeado)\n\n"
+        ),
+        inline=False
+    )
+
+    # Sección de Comandos (2/2)
+    embed.add_field(
+        name="📋 Comandos Disponibles (2/2):",
+        value=(
+            "**• random**\n"
+            "  Elige un manhwa al azar de tu lista\n\n"
+            "**• recordatorios**\n"
+            f"  Muestra los manhwas 'Leyendo' sin actualizar hace más de {UMBRAL_DIAS_RECORDATORIO} días\n\n"
+            "**• stats**\n"
+            "  Muestra estadísticas de tu colección\n\n"
+            "**• exportar**\n"
+            "  Descarga un respaldo de tu lista en JSON\n\n"
+            "**• importar [archivo]**\n"
+            "  Restaura manhwas desde un respaldo .json (adjunta el archivo al comando)\n\n"
             "**• lector [usuario]**\n"
             "  Le asigna permisos a un usuario para poder guardar manhwas, mangas, manhuas en el bot\n\n"
             "**• revocar [usuario]**\n"
@@ -116,10 +149,16 @@ async def info(ctx):
         value=(
             "**Comandos nuevos**\n"
             "• `eliminar` — borra un manhwa de tu lista (con confirmación).\n"
-            "• `revocar` — le quita permisos de lector a un usuario.\n\n"
+            "• `revocar` — le quita permisos de lector a un usuario.\n"
+            "• `estado` — marca un manhwa como Leyendo, Favorito, En pausa, Terminado o Dropeado.\n"
+            "• `random` — elige un manhwa al azar para leer.\n"
+            "• `recordatorios` — te avisa qué llevas mucho tiempo sin actualizar.\n"
+            "• `stats` — resumen de tu colección (total, capítulos, más avanzado, por estado).\n"
+            "• `exportar`/`importar` — respaldo y restauración de tu lista como archivo JSON.\n\n"
             "**Slash commands**\n"
-            "• Todos los comandos ahora también funcionan con `/`, con autocompletado nativo de Discord.\n"
-            "• `/lector` te deja elegir al usuario directamente desde un selector, sin escribir el nombre.\n"
+            "• Todos los comandos también funcionan con `/`, con autocompletado nativo.\n"
+            "• `/listar`, `/eliminar` y `/estado` sugieren tus propios manhwas mientras escribes.\n"
+            "• `/lector` te deja elegir al usuario directamente desde un selector.\n"
         ),
         inline=False
     )
@@ -138,6 +177,7 @@ async def info(ctx):
             "**Seguridad**\n"
             "• `lector` valida que el usuario exista en el servidor y evita duplicados.\n"
             "• Mejor manejo de errores y mensajes más claros cuando algo falla.\n"
+            f"• `listar` marca con ⏰ los manhwas 'Leyendo' sin actualizar hace {UMBRAL_DIAS_RECORDATORIO}+ días.\n"
         ),
         inline=False
     )
@@ -278,7 +318,7 @@ async def guardar(ctx, *, datos: str): # El argumento datos es una cadena que pu
 
         actualizacion = {
             "$set": campos_set,
-            "$setOnInsert": {"nombre_manhwa": nombre, "usuario": usuario}
+            "$setOnInsert": {"nombre_manhwa": nombre, "usuario": usuario, "estado": "leyendo"}
         }
 
         resultado = collection.update_one(filtro, actualizacion, upsert=True)
@@ -293,6 +333,8 @@ async def guardar(ctx, *, datos: str): # El argumento datos es una cadena que pu
         embed.add_field(name="Capítulo", value=capitulo, inline=False)
         if link:
             embed.add_field(name="Link", value=link, inline=False)
+        if es_nuevo:
+            embed.add_field(name="Estado", value=ESTADOS["leyendo"], inline=False)
         embed.set_footer(text=f"Guardado por {ctx.author}")
 
         await ctx.send(embed=embed)
@@ -353,6 +395,292 @@ async def eliminar(ctx, *, nombre_manhwa: str):
         await ctx.send("❌ Error al eliminar el manhwa.")
         logger.error(f"Error en eliminar: {e}")
 
+# cambia el estado de lectura de un manhwa (leyendo, favorito, en pausa, terminado, dropeado)
+@bot.hybrid_command(name='estado', description="Cambia el estado de lectura de un manhwa")
+@app_commands.describe(nombre_manhwa="Nombre (o parte) del manhwa")
+async def estado(ctx, *, nombre_manhwa: str):
+    try:
+        result = collection2.find_one({"usuario": str(ctx.author)})
+
+        if result is None:
+            await ctx.send("❌ No tienes permisos suficientes para realizar esta acción.")
+            return
+
+        usuario = str(ctx.author)
+        filtro = {
+            "usuario": usuario,
+            "nombre_manhwa": {"$regex": re.escape(nombre_manhwa), "$options": "i"}
+        }
+        registros = list(collection.find(filtro))
+
+        if not registros:
+            await ctx.send(f"❌ No se encontró '{nombre_manhwa}' en tu lista.")
+            return
+
+        async def solicitar_estado(send_func, registro):
+            view = crear_selector_estado(ctx.author, registro)
+            view.message = await send_func(
+                f"📋 Elige el nuevo estado para **{registro['nombre_manhwa']}**:", view=view
+            )
+
+        if len(registros) > 1:
+            async def al_seleccionar(interaction, registro):
+                await solicitar_estado(interaction.followup.send, registro)
+
+            selector = crear_selector_manhwas(
+                ctx.author, registros, al_seleccionar, placeholder="Elige un manhwa..."
+            )
+            selector.message = await ctx.send("🔍 Se encontraron varias coincidencias, elige una:", view=selector)
+            return
+
+        await solicitar_estado(ctx.send, registros[0])
+
+    except Exception as e:
+        await ctx.send("❌ Error al cambiar el estado.")
+        logger.error(f"Error en estado: {e}")
+
+# elige un manhwa al azar de tu lista (para cuando no sabes qué leer)
+@bot.hybrid_command(name='random', description="Elige un manhwa al azar de tu lista para leer")
+async def elegir_random(ctx):
+    try:
+        result = collection2.find_one({"usuario": str(ctx.author)})
+        if result is None:
+            await ctx.send("❌ No tienes permisos suficientes para realizar esta acción.")
+            return
+
+        usuario = str(ctx.author)
+        registros = list(collection.find({"usuario": usuario}))
+
+        if not registros:
+            await ctx.send("🔍 No se encontraron manhwas para este usuario.")
+            return
+
+        # Prioriza manhwas que no estén terminados o dropeados; si no hay, elige de toda la lista
+        candidatos = [r for r in registros if r.get("estado", "leyendo") not in ("terminado", "dropeado")]
+        if not candidatos:
+            candidatos = registros
+
+        registro = random.choice(candidatos)
+        await enviar_detalle_manhwa(ctx.send, usuario, registro)
+
+    except Exception as e:
+        await ctx.send("❌ Error al elegir un manhwa al azar.")
+        logger.error(f"Error en random: {e}")
+
+# muestra los manhwas "Leyendo" que llevan mucho tiempo sin actualizarse
+@bot.hybrid_command(
+    name='recordatorios',
+    description=f"Muestra los manhwas que llevas más de {UMBRAL_DIAS_RECORDATORIO} días sin actualizar"
+)
+async def recordatorios(ctx):
+    try:
+        result = collection2.find_one({"usuario": str(ctx.author)})
+        if result is None:
+            await ctx.send("❌ No tienes permisos suficientes para realizar esta acción.")
+            return
+
+        usuario = str(ctx.author)
+        limite = datetime.now() - timedelta(days=UMBRAL_DIAS_RECORDATORIO)
+        registros = list(collection.find({
+            "usuario": usuario,
+            "estado": "leyendo",
+            "fecha_guardado": {"$lt": limite}
+        }))
+
+        if not registros:
+            await ctx.send(f"✅ No tienes manhwas en Leyendo con más de {UMBRAL_DIAS_RECORDATORIO} días sin actualizar. ¡Vas al día!")
+            return
+
+        registros.sort(key=lambda r: r["fecha_guardado"])
+
+        embed = discord.Embed(
+            title="⏰ Manhwas que quizás olvidaste",
+            description=f"Llevan más de {UMBRAL_DIAS_RECORDATORIO} días sin actualizarse:",
+            color=discord.Color.orange()
+        )
+        for r in registros[:25]:
+            dias = (datetime.now() - r["fecha_guardado"]).days
+            embed.add_field(
+                name=f"📖 {r['nombre_manhwa']}",
+                value=f"Cap. {r['capitulo']:g} · hace {dias} días",
+                inline=False
+            )
+
+        await ctx.send(embed=embed)
+
+    except Exception as e:
+        await ctx.send("❌ Error al generar los recordatorios.")
+        logger.error(f"Error en recordatorios: {e}")
+
+# muestra estadísticas de la colección del usuario
+@bot.hybrid_command(name='stats', description="Muestra estadísticas de tu colección de manhwas")
+async def stats(ctx):
+    try:
+        result = collection2.find_one({"usuario": str(ctx.author)})
+        if result is None:
+            await ctx.send("❌ No tienes permisos suficientes para realizar esta acción.")
+            return
+
+        usuario = str(ctx.author)
+        registros = list(collection.find({"usuario": usuario}))
+
+        if not registros:
+            await ctx.send("🔍 No se encontraron manhwas para este usuario.")
+            return
+
+        total_manhwas = len(registros)
+        total_capitulos = sum(r.get("capitulo", 0) for r in registros)
+
+        conteo_estados = {valor: 0 for valor in ESTADOS}
+        for r in registros:
+            estado_actual = r.get("estado", "leyendo")
+            conteo_estados[estado_actual] = conteo_estados.get(estado_actual, 0) + 1
+
+        mas_avanzado = max(registros, key=lambda r: r.get("capitulo", 0))
+
+        embed = discord.Embed(title=f"📊 Estadísticas de {usuario}", color=discord.Color.gold())
+        embed.add_field(name="📚 Total de manhwas", value=str(total_manhwas), inline=True)
+        embed.add_field(name="📖 Capítulos acumulados", value=f"{total_capitulos:g}", inline=True)
+        embed.add_field(
+            name="🏆 Más avanzado",
+            value=f"{mas_avanzado['nombre_manhwa']} (cap. {mas_avanzado['capitulo']:g})",
+            inline=False
+        )
+
+        desglose = "\n".join(f"{ESTADOS[valor]}: {conteo_estados[valor]}" for valor in ESTADOS)
+        embed.add_field(name="📋 Por estado", value=desglose, inline=False)
+
+        await ctx.send(embed=embed)
+
+    except Exception as e:
+        await ctx.send("❌ Error al generar las estadísticas.")
+        logger.error(f"Error en stats: {e}")
+
+# exporta la lista del usuario como respaldo en formato JSON
+@bot.hybrid_command(name='exportar', description="Exporta tu lista de manhwas como archivo de respaldo (JSON)")
+async def exportar(ctx):
+    try:
+        result = collection2.find_one({"usuario": str(ctx.author)})
+        if result is None:
+            await ctx.send("❌ No tienes permisos suficientes para realizar esta acción.")
+            return
+
+        usuario = str(ctx.author)
+        registros = list(collection.find({"usuario": usuario}))
+
+        if not registros:
+            await ctx.send("🔍 No se encontraron manhwas para este usuario.")
+            return
+
+        datos_exportables = [
+            {
+                "nombre_manhwa": r.get("nombre_manhwa"),
+                "capitulo": r.get("capitulo"),
+                "link": r.get("link"),
+                "estado": r.get("estado", "leyendo"),
+                "fecha_guardado": r["fecha_guardado"].isoformat() if r.get("fecha_guardado") else None,
+            }
+            for r in registros
+        ]
+
+        contenido = json.dumps(datos_exportables, ensure_ascii=False, indent=2)
+        archivo = discord.File(io.BytesIO(contenido.encode("utf-8")), filename="manhwas_backup.json")
+
+        await ctx.send(f"📦 Aquí tienes tu respaldo con {len(datos_exportables)} manhwa(s).", file=archivo)
+
+    except Exception as e:
+        await ctx.send("❌ Error al exportar tu lista.")
+        logger.error(f"Error en exportar: {e}")
+
+# importa manhwas desde un archivo de respaldo generado por !exportar
+@bot.hybrid_command(name='importar', description="Importa manhwas desde un archivo de respaldo JSON")
+@app_commands.describe(archivo="Archivo .json generado previamente con /exportar")
+async def importar(ctx, archivo: discord.Attachment):
+    try:
+        result = collection2.find_one({"usuario": str(ctx.author)})
+        if result is None:
+            await ctx.send("❌ No tienes permisos suficientes para realizar esta acción.")
+            return
+
+        if not archivo.filename.lower().endswith(".json"):
+            await ctx.send("❌ El archivo debe ser un .json (como el que genera `!exportar`).")
+            return
+
+        if archivo.size > 2 * 1024 * 1024:
+            await ctx.send("❌ El archivo es demasiado grande (máximo 2 MB).")
+            return
+
+        contenido = await archivo.read()
+        try:
+            datos = json.loads(contenido.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            await ctx.send("❌ El archivo no es un JSON válido.")
+            return
+
+        if not isinstance(datos, list):
+            await ctx.send("❌ Formato inválido: se esperaba una lista de manhwas.")
+            return
+
+        usuario = str(ctx.author)
+        importados = 0
+        actualizados = 0
+        omitidos = 0
+
+        for item in datos:
+            if not isinstance(item, dict):
+                omitidos += 1
+                continue
+
+            nombre = item.get("nombre_manhwa")
+            capitulo = item.get("capitulo")
+
+            if not nombre or capitulo is None:
+                omitidos += 1
+                continue
+
+            try:
+                capitulo = float(capitulo)
+            except (TypeError, ValueError):
+                omitidos += 1
+                continue
+
+            estado_valor = item.get("estado", "leyendo")
+            if estado_valor not in ESTADOS:
+                estado_valor = "leyendo"
+
+            try:
+                fecha_guardado = datetime.fromisoformat(item["fecha_guardado"]) if item.get("fecha_guardado") else datetime.now()
+            except (ValueError, TypeError):
+                fecha_guardado = datetime.now()
+
+            campos_set = {"capitulo": capitulo, "estado": estado_valor, "fecha_guardado": fecha_guardado}
+            if item.get("link"):
+                campos_set["link"] = item["link"]
+
+            filtro = {
+                "usuario": usuario,
+                "nombre_manhwa": {"$regex": f"^{re.escape(nombre)}$", "$options": "i"}
+            }
+            actualizacion = {
+                "$set": campos_set,
+                "$setOnInsert": {"nombre_manhwa": nombre, "usuario": usuario}
+            }
+
+            resultado = collection.update_one(filtro, actualizacion, upsert=True)
+            if resultado.upserted_id is not None:
+                importados += 1
+            else:
+                actualizados += 1
+
+        await ctx.send(
+            f"📥 Importación completa: **{importados}** nuevo(s), **{actualizados}** actualizado(s)"
+            + (f", **{omitidos}** omitido(s) por datos inválidos." if omitidos else ".")
+        )
+
+    except Exception as e:
+        await ctx.send("❌ Error al importar el archivo.")
+        logger.error(f"Error en importar: {e}")
+
 # listar uno o varios manhwas
 @bot.hybrid_command(name="listar", description="Lista tus manhwas guardados o busca uno por nombre")
 @app_commands.describe(nombre_manhwa="Nombre (o parte) del manhwa a buscar (opcional)")
@@ -371,6 +699,20 @@ async def listar(ctx, *, nombre_manhwa: str = None):
     except Exception as e:
         await ctx.send("❌ Hubo un error al listar los manhwas.")
         logger.error(f"Error en listar: {e}")
+
+async def autocompletar_manhwa(interaction: discord.Interaction, current: str):
+    """Sugiere nombres de manhwas ya guardados por el usuario para los slash commands."""
+    usuario = str(interaction.user)
+    query = {"usuario": usuario, "nombre_manhwa": {"$regex": re.escape(current), "$options": "i"}}
+    registros = collection.find(query).limit(25)
+    return [
+        app_commands.Choice(name=r["nombre_manhwa"][:100], value=r["nombre_manhwa"])
+        for r in registros
+    ]
+
+listar.autocomplete("nombre_manhwa")(autocompletar_manhwa)
+eliminar.autocomplete("nombre_manhwa")(autocompletar_manhwa)
+estado.autocomplete("nombre_manhwa")(autocompletar_manhwa)
 
 async def listar_todos(ctx):
     usuario = str(ctx.author)
@@ -398,11 +740,21 @@ async def listar_todos(ctx):
         )
 
         for registro in registros_pagina:
+            estado_valor = registro.get("estado", "leyendo")
+            estado = ESTADOS.get(estado_valor, ESTADOS["leyendo"])
+            dias_inactivo = (datetime.now() - registro["fecha_guardado"]).days
+            olvidado = estado_valor == "leyendo" and dias_inactivo >= UMBRAL_DIAS_RECORDATORIO
+
             valor_manhwa = (
                 f"**Capítulo actual:** {registro['capitulo']}\n"
+                f"**Estado:** {estado}\n"
                 f"**Fecha Guardado:** {registro['fecha_guardado'].strftime('%Y-%m-%d')}"
             )
-            embed.add_field(name=f"📖 {registro['nombre_manhwa']}", value=valor_manhwa, inline=False)
+            if olvidado:
+                valor_manhwa += f"\n⏰ *Sin actualizar hace {dias_inactivo} días*"
+
+            prefijo = "⏰ " if olvidado else "📖 "
+            embed.add_field(name=f"{prefijo}{registro['nombre_manhwa']}", value=valor_manhwa, inline=False)
 
         return embed
 
@@ -422,10 +774,16 @@ async def listar_todos(ctx):
         boton_siguiente = Button(label="➡️ Siguiente", style=discord.ButtonStyle.primary, disabled=(pagina_actual >= total_paginas - 1))
 
         async def anterior_callback(interaction: discord.Interaction):
+            if interaction.user != ctx.author:
+                await interaction.response.send_message("❌ No puedes controlar esta lista.", ephemeral=True)
+                return
             if pagina_actual > 0:
                 await actualizar_mensaje(interaction, pagina_actual - 1)
 
         async def siguiente_callback(interaction: discord.Interaction):
+            if interaction.user != ctx.author:
+                await interaction.response.send_message("❌ No puedes controlar esta lista.", ephemeral=True)
+                return
             if pagina_actual < total_paginas - 1:
                 await actualizar_mensaje(interaction, pagina_actual + 1)
 
@@ -441,9 +799,11 @@ async def listar_todos(ctx):
 
 async def enviar_detalle_manhwa(send_func, usuario, registro):
     """Envía el embed de detalle de un manhwa junto con el botón de actualizar capítulo."""
+    estado = ESTADOS.get(registro.get("estado", "leyendo"), ESTADOS["leyendo"])
     embed = discord.Embed(title=f"📚 Manhwa: {registro['nombre_manhwa']}", color=discord.Color.blue())
     valor_manhwa = (
         f"**Capítulo actual:** {registro['capitulo']}\n"
+        f"**Estado:** {estado}\n"
         f"**Fecha Guardado:** {registro['fecha_guardado'].strftime('%Y-%m-%d')}\n"
         f"**Link:** [Ir al manhwa]({registro['link']})"
     )
@@ -520,6 +880,46 @@ def crear_vista_confirmacion(autor, on_confirmar, mensaje_cancelado="❌ Acción
 
     view.add_item(boton_confirmar)
     view.add_item(boton_cancelar)
+    return view
+
+def crear_selector_estado(autor, registro, timeout=30):
+    """Menú desplegable para cambiar el estado de lectura de un manhwa."""
+    view = View(timeout=timeout)
+    view.message = None
+
+    opciones = [
+        discord.SelectOption(label=etiqueta, value=valor)
+        for valor, etiqueta in ESTADOS.items()
+    ]
+    select = Select(placeholder="Elige el nuevo estado...", options=opciones)
+
+    async def seleccionar_callback(interaction: discord.Interaction):
+        if interaction.user != autor:
+            await interaction.response.send_message("❌ No puedes usar este menú.", ephemeral=True)
+            return
+
+        nuevo_estado = select.values[0]
+        collection.update_one({"_id": registro["_id"]}, {"$set": {"estado": nuevo_estado}})
+
+        for item in view.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"✅ **{registro['nombre_manhwa']}** ahora está marcado como {ESTADOS[nuevo_estado]}.",
+            view=view
+        )
+
+    async def on_timeout():
+        for item in view.children:
+            item.disabled = True
+        if view.message:
+            try:
+                await view.message.edit(content="⏳ Tiempo agotado.", view=view)
+            except discord.HTTPException:
+                pass
+
+    select.callback = seleccionar_callback
+    view.on_timeout = on_timeout
+    view.add_item(select)
     return view
 
 def crear_selector_manhwas(autor, registros, on_seleccionar, placeholder="Elige un manhwa...", timeout=30):
