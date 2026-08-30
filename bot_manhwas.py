@@ -10,6 +10,8 @@ import re
 import json
 import io
 import random
+import asyncio
+import aiohttp
 from discord.ui import View, Button, Select, Modal, TextInput
 
 load_dotenv()
@@ -61,6 +63,169 @@ ESTADOS = {
 
 UMBRAL_DIAS_RECORDATORIO = 14  # días sin actualizar un manhwa "Leyendo" antes de considerarlo olvidado
 
+# --- Integración con AniList (búsqueda pública, sin API key) ---
+
+ANILIST_API_URL = "https://graphql.anilist.co"
+
+ANILIST_SEARCH_QUERY = """
+query ($search: String) {
+  Page(page: 1, perPage: 5) {
+    media(search: $search, type: MANGA) {
+      id
+      title { romaji english native }
+      format
+      status
+      chapters
+      genres
+      countryOfOrigin
+      description(asHtml: false)
+      coverImage { large }
+      siteUrl
+    }
+  }
+}
+"""
+
+TIPO_POR_PAIS_ANILIST = {
+    "JP": "🇯🇵 Manga (Japón)",
+    "KR": "🇰🇷 Manhwa (Corea)",
+    "CN": "🇨🇳 Manhua (China)",
+    "TW": "🇹🇼 Manhua (Taiwán)",
+}
+
+ESTADO_POR_ANILIST = {
+    "FINISHED": "Finalizado",
+    "RELEASING": "En emisión",
+    "NOT_YET_RELEASED": "Aún no publicado",
+    "CANCELLED": "Cancelado",
+    "HIATUS": "En pausa",
+}
+
+async def buscar_en_anilist(nombre: str):
+    """Busca un manga/manhwa/manhua en AniList. Devuelve una lista de resultados (vacía si no hay o falla la API)."""
+    payload = {"query": ANILIST_SEARCH_QUERY, "variables": {"search": nombre}}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.post(ANILIST_API_URL, json=payload) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+                return (data.get("data") or {}).get("Page", {}).get("media", []) or []
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.error(f"Error consultando AniList: {e}")
+        return []
+
+def limpiar_descripcion_anilist(descripcion, max_len=300):
+    """Quita las etiquetas HTML que devuelve AniList y recorta la descripción."""
+    if not descripcion:
+        return None
+    texto = re.sub(r"<[^>]+>", "", descripcion).strip()
+    if len(texto) > max_len:
+        texto = texto[:max_len].rsplit(" ", 1)[0] + "…"
+    return texto
+
+def extraer_datos_anilist(candidato):
+    """Extrae los campos que guardaremos en Mongo a partir de un resultado de AniList."""
+    titulo = candidato.get("title", {})
+    return {
+        "imagen": (candidato.get("coverImage") or {}).get("large"),
+        "anilist_id": candidato.get("id"),
+        "titulo_romaji": titulo.get("romaji"),
+        "titulo_ingles": titulo.get("english"),
+        "titulo_nativo": titulo.get("native"),
+        "anilist_url": candidato.get("siteUrl"),
+    }
+
+def construir_embed_candidato_anilist(candidato, indice, total):
+    """Genera el embed con la info + imagen de un resultado de AniList, para que el usuario lo identifique."""
+    titulo_data = candidato.get("title", {})
+    titulo_principal = titulo_data.get("english") or titulo_data.get("romaji") or titulo_data.get("native") or "Sin título"
+    titulo_alt = titulo_data.get("romaji") if titulo_data.get("romaji") != titulo_principal else titulo_data.get("native")
+
+    tipo = TIPO_POR_PAIS_ANILIST.get(candidato.get("countryOfOrigin"), candidato.get("countryOfOrigin") or "Desconocido")
+    estado = ESTADO_POR_ANILIST.get(candidato.get("status"), candidato.get("status") or "—")
+    capitulos = candidato.get("chapters") or "En curso"
+
+    embed = discord.Embed(
+        title=titulo_principal,
+        url=candidato.get("siteUrl"),
+        description=limpiar_descripcion_anilist(candidato.get("description")),
+        color=discord.Color.blue()
+    )
+    if titulo_alt:
+        embed.add_field(name="Título alternativo", value=titulo_alt, inline=False)
+    embed.add_field(name="Tipo", value=tipo, inline=True)
+    embed.add_field(name="Estado en AniList", value=estado, inline=True)
+    embed.add_field(name="Capítulos", value=str(capitulos), inline=True)
+    if candidato.get("genres"):
+        embed.add_field(name="Géneros", value=", ".join(candidato["genres"][:5]), inline=False)
+
+    imagen = (candidato.get("coverImage") or {}).get("large")
+    if imagen:
+        embed.set_image(url=imagen)
+
+    embed.set_footer(text=f"Resultado {indice + 1}/{total} en AniList — haz clic en la imagen para verla en grande")
+    return embed
+
+def crear_vista_busqueda_anilist(autor, candidatos, on_confirmar, on_manual, timeout=60):
+    """Vista para navegar los resultados de AniList y confirmar cuál guardar.
+    on_confirmar es async(interaction, candidato). on_manual es async(interaction)."""
+    view = View(timeout=timeout)
+    view.message = None
+    estado = {"indice": 0}
+
+    boton_confirmar = Button(label="✅ Es este", style=discord.ButtonStyle.success)
+    boton_siguiente = Button(label="➡️ Siguiente resultado", style=discord.ButtonStyle.primary, disabled=len(candidatos) <= 1)
+    boton_manual = Button(label="✏️ Ninguno, guardar manual", style=discord.ButtonStyle.secondary)
+
+    async def confirmar_callback(interaction: discord.Interaction):
+        if interaction.user != autor:
+            await interaction.response.send_message("❌ No puedes usar este menú.", ephemeral=True)
+            return
+        for item in view.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=view)
+        await on_confirmar(interaction, candidatos[estado["indice"]])
+        view.stop()
+
+    async def siguiente_callback(interaction: discord.Interaction):
+        if interaction.user != autor:
+            await interaction.response.send_message("❌ No puedes usar este menú.", ephemeral=True)
+            return
+        estado["indice"] = (estado["indice"] + 1) % len(candidatos)
+        embed = construir_embed_candidato_anilist(candidatos[estado["indice"]], estado["indice"], len(candidatos))
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def manual_callback(interaction: discord.Interaction):
+        if interaction.user != autor:
+            await interaction.response.send_message("❌ No puedes usar este menú.", ephemeral=True)
+            return
+        for item in view.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=view)
+        await on_manual(interaction)
+        view.stop()
+
+    async def on_timeout():
+        for item in view.children:
+            item.disabled = True
+        if view.message:
+            try:
+                await view.message.edit(view=view)
+            except discord.HTTPException:
+                pass
+
+    boton_confirmar.callback = confirmar_callback
+    boton_siguiente.callback = siguiente_callback
+    boton_manual.callback = manual_callback
+    view.on_timeout = on_timeout
+
+    view.add_item(boton_confirmar)
+    if len(candidatos) > 1:
+        view.add_item(boton_siguiente)
+    view.add_item(boton_manual)
+    return view
+
 # Evento on_ready
 @bot.event
 async def on_ready():
@@ -107,7 +272,7 @@ async def info(ctx):
             "**• info**\n"
             "  Muestra la información del bot\n\n"
             "**• guardar nombre, capitulo, link (opcional)**\n"
-            "  Guarda un nuevo manhwa en tu lista\n"
+            "  Guarda un nuevo manhwa en tu lista (busca en AniList para ayudarte a identificarlo)\n"
             "  Si el nombre tiene comas, enciérralo entre [ ] o \" \": !guardar [Solo Leveling, Ragnarok], 12\n\n"
             "**• listar**\n"
             "  Muestra todos tus manhwas guardados\n\n"
@@ -178,6 +343,20 @@ async def info(ctx):
             "• `lector` valida que el usuario exista en el servidor y evita duplicados.\n"
             "• Mejor manejo de errores y mensajes más claros cuando algo falla.\n"
             f"• `listar` marca con ⏰ los manhwas 'Leyendo' sin actualizar hace {UMBRAL_DIAS_RECORDATORIO}+ días.\n"
+        ),
+        inline=False
+    )
+
+    # Sección de Novedades (3/3) — AniList
+    embed.add_field(
+        name="🆕 Novedades — Integración con AniList",
+        value=(
+            "• Al guardar un manhwa nuevo, el bot lo busca en AniList y te muestra su portada, "
+            "títulos en otros idiomas, género y estado para que lo identifiques fácil, incluso si "
+            "el nombre está en coreano/japonés/chino.\n"
+            "• Si no aparece en AniList (o la API falla), lo guardas libremente como siempre.\n"
+            "• La portada queda guardada y se muestra en `listar [nombre]` y `random` — haz clic en "
+            "la imagen para verla en grande.\n"
         ),
         inline=False
     )
@@ -274,6 +453,43 @@ def extraer_partes(datos: str):
     partes_resto = [p.strip() for p in resto.split(',')] if resto else []
     return [nombre] + partes_resto
 
+async def guardar_o_actualizar(send_func, usuario, nombre, capitulo, link, datos_anilist=None):
+    """Hace el upsert en Mongo y envía el embed de confirmación. Reutilizado por el flujo manual
+    y por el flujo de confirmación con AniList."""
+    filtro = {
+        "usuario": usuario,
+        "nombre_manhwa": {"$regex": f"^{re.escape(nombre)}$", "$options": "i"}
+    }
+    campos_set = {"capitulo": capitulo, "fecha_guardado": datetime.now()}
+    if link:
+        campos_set["link"] = link
+    if datos_anilist:
+        campos_set.update(datos_anilist)
+
+    actualizacion = {
+        "$set": campos_set,
+        "$setOnInsert": {"nombre_manhwa": nombre, "usuario": usuario, "estado": "leyendo"}
+    }
+
+    resultado = collection.update_one(filtro, actualizacion, upsert=True)
+    es_nuevo = resultado.upserted_id is not None
+
+    embed = discord.Embed(
+        title="✅ Manhwa Guardado" if es_nuevo else "🔄 Manhwa Actualizado",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Nombre", value=nombre, inline=False)
+    embed.add_field(name="Capítulo", value=capitulo, inline=False)
+    if link:
+        embed.add_field(name="Link", value=link, inline=False)
+    if es_nuevo:
+        embed.add_field(name="Estado", value=ESTADOS["leyendo"], inline=False)
+    if datos_anilist and datos_anilist.get("imagen"):
+        embed.set_thumbnail(url=datos_anilist["imagen"])
+    embed.set_footer(text=f"Guardado por {usuario}")
+
+    await send_func(embed=embed)
+
 @bot.hybrid_command(name='guardar', description="Guarda o actualiza un manhwa en tu lista")
 @app_commands.describe(datos="nombre, capítulo, link opcional. Si el nombre tiene comas, enciérralo entre [ ] o \" \"")
 async def guardar(ctx, *, datos: str): # El argumento datos es una cadena que puede contener espacios, * captura toda la linea de texto
@@ -292,52 +508,52 @@ async def guardar(ctx, *, datos: str): # El argumento datos es una cadena que pu
         if len(partes) < 2:
             await ctx.send("❌ Formato incorrecto. Usa: nombre, capítulo, [link]")
             return
-        
+
         # Extraer datos
         nombre = partes[0]
-        
+
         # Convertir capítulo a entero, manejar posibles errores
         try:
             capitulo = float(partes[1])
         except ValueError:
             await ctx.send("❌ El capítulo debe ser un número válido.")
             return
-        
+
         # Link es opcional
         link = partes[2] if len(partes) > 2 else None
         usuario = str(ctx.author)
 
-        # Upsert por usuario + nombre (case-insensitive) para no duplicar el manhwa
-        filtro = {
+        # Si el manhwa ya existe para este usuario, solo actualizamos (sin volver a buscar en AniList)
+        ya_existe = collection.find_one({
             "usuario": usuario,
             "nombre_manhwa": {"$regex": f"^{re.escape(nombre)}$", "$options": "i"}
-        }
-        campos_set = {"capitulo": capitulo, "fecha_guardado": datetime.now()}
-        if link:
-            campos_set["link"] = link
+        }) is not None
 
-        actualizacion = {
-            "$set": campos_set,
-            "$setOnInsert": {"nombre_manhwa": nombre, "usuario": usuario, "estado": "leyendo"}
-        }
+        if ya_existe:
+            await guardar_o_actualizar(ctx.send, usuario, nombre, capitulo, link)
+            return
 
-        resultado = collection.update_one(filtro, actualizacion, upsert=True)
-        es_nuevo = resultado.upserted_id is not None
+        # Es un manhwa nuevo: buscamos en AniList para ayudar a identificarlo (nombres en otro idioma, etc.)
+        async with ctx.typing():
+            candidatos = await buscar_en_anilist(nombre)
 
-        # Mensaje de confirmación con embed
-        embed = discord.Embed(
-            title="✅ Manhwa Guardado" if es_nuevo else "🔄 Manhwa Actualizado",
-            color=discord.Color.green()
+        if not candidatos:
+            # No se encontró nada en AniList (o la API falló): se guarda libremente, como antes
+            await guardar_o_actualizar(ctx.send, usuario, nombre, capitulo, link)
+            return
+
+        async def al_confirmar(interaction, candidato):
+            datos_anilist = extraer_datos_anilist(candidato)
+            await guardar_o_actualizar(interaction.followup.send, usuario, nombre, capitulo, link, datos_anilist)
+
+        async def al_elegir_manual(interaction):
+            await guardar_o_actualizar(interaction.followup.send, usuario, nombre, capitulo, link)
+
+        embed = construir_embed_candidato_anilist(candidatos[0], 0, len(candidatos))
+        vista = crear_vista_busqueda_anilist(ctx.author, candidatos, al_confirmar, al_elegir_manual)
+        vista.message = await ctx.send(
+            f"🔎 Encontré esto en AniList para \"{nombre}\". ¿Es tu manhwa?", embed=embed, view=vista
         )
-        embed.add_field(name="Nombre", value=nombre, inline=False)
-        embed.add_field(name="Capítulo", value=capitulo, inline=False)
-        if link:
-            embed.add_field(name="Link", value=link, inline=False)
-        if es_nuevo:
-            embed.add_field(name="Estado", value=ESTADOS["leyendo"], inline=False)
-        embed.set_footer(text=f"Guardado por {ctx.author}")
-
-        await ctx.send(embed=embed)
 
     except Exception as e:
         await ctx.send("❌ Error al guardar el manhwa.")
@@ -579,6 +795,12 @@ async def exportar(ctx):
                 "link": r.get("link"),
                 "estado": r.get("estado", "leyendo"),
                 "fecha_guardado": r["fecha_guardado"].isoformat() if r.get("fecha_guardado") else None,
+                "imagen": r.get("imagen"),
+                "anilist_id": r.get("anilist_id"),
+                "titulo_romaji": r.get("titulo_romaji"),
+                "titulo_ingles": r.get("titulo_ingles"),
+                "titulo_nativo": r.get("titulo_nativo"),
+                "anilist_url": r.get("anilist_url"),
             }
             for r in registros
         ]
@@ -656,6 +878,9 @@ async def importar(ctx, archivo: discord.Attachment):
             campos_set = {"capitulo": capitulo, "estado": estado_valor, "fecha_guardado": fecha_guardado}
             if item.get("link"):
                 campos_set["link"] = item["link"]
+            for campo_anilist in ("imagen", "anilist_id", "titulo_romaji", "titulo_ingles", "titulo_nativo", "anilist_url"):
+                if item.get(campo_anilist):
+                    campos_set[campo_anilist] = item[campo_anilist]
 
             filtro = {
                 "usuario": usuario,
@@ -809,6 +1034,13 @@ async def enviar_detalle_manhwa(send_func, usuario, registro):
     )
     embed.add_field(name="📖 Detalles", value=valor_manhwa, inline=False)
 
+    titulo_alt = registro.get("titulo_ingles") or registro.get("titulo_romaji")
+    if titulo_alt and titulo_alt.lower() != registro["nombre_manhwa"].lower():
+        embed.add_field(name="Título alternativo (AniList)", value=titulo_alt, inline=False)
+
+    if registro.get("imagen"):
+        embed.set_image(url=registro["imagen"])  # clic en la imagen la expande en Discord
+
     view = crear_vista_boton(usuario, registro["nombre_manhwa"])
     message = await send_func(embed=embed, view=view)
 
@@ -930,7 +1162,11 @@ def crear_selector_manhwas(autor, registros, on_seleccionar, placeholder="Elige 
 
     registros_por_id = {str(r["_id"]): r for r in registros[:25]}
     opciones = [
-        discord.SelectOption(label=r["nombre_manhwa"][:100], value=str(r["_id"]))
+        discord.SelectOption(
+            label=r["nombre_manhwa"][:100],
+            value=str(r["_id"]),
+            description=(r.get("titulo_ingles") or r.get("titulo_romaji") or "")[:100] or None
+        )
         for r in registros[:25]
     ]
     select = Select(placeholder=placeholder, options=opciones)
